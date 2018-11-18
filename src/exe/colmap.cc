@@ -1376,15 +1376,21 @@ int RunPointTriangulator(int argc, char** argv) {
 //       },
 //       {
 //           "camera_id": 2,
-//           "image_prefix": "left2_image"
+//           "image_prefix": "left2_image",
+//           "rel_qvec": [0.1, 0.2, 0.3, 0.4],
+//           "rel_tvec": [0.1, 0.2, 0.3]
 //       },
 //       {
 //           "camera_id": 3,
-//           "image_prefix": "right1_image"
+//           "image_prefix": "right1_image",
+//           "rel_qvec": [0.1, 0.2, 0.3, 0.4],
+//           "rel_tvec": [0.1, 0.2, 0.3]
 //       },
 //       {
 //           "camera_id": 4,
-//           "image_prefix": "right2_image"
+//           "image_prefix": "right2_image",
+//           "rel_qvec": [0.1, 0.2, 0.3, 0.4],
+//           "rel_tvec": [0.1, 0.2, 0.3]
 //       }
 //     ]
 //   }
@@ -1423,27 +1429,87 @@ int RunPointTriangulator(int argc, char** argv) {
 //            frame002.png
 //            ...
 //
-// TODO: Provide an option to manually / explicitly set the relative extrinsics
-// of the camera rig. At the moment, the relative extrinsics are automatically
-// inferred from the reconstruction.
+// Specifying the relative camera poses in the rig with "rel_qvec" and "rel_tvec"
+// is optional. If they are specified, this must be done for all cameras except
+// the reference camera (which always has the identity relative pose). The
+// --refine_relative_poses option can then be used to disable their optimization.
+// TODO: Say which direction the transformation needs to be (rig to camera or
+//       camera to rig).
 std::vector<CameraRig> ReadCameraRigConfig(
-    const std::string& rig_config_path, const Reconstruction& reconstruction) {
+    const std::string& rig_config_path, Reconstruction& reconstruction) {
   boost::property_tree::ptree pt;
   boost::property_tree::read_json(rig_config_path.c_str(), pt);
 
   std::vector<CameraRig> camera_rigs;
   for (const auto& rig_config : pt) {
     CameraRig camera_rig;
+    
+    int ref_camera_id = rig_config.second.get<int>("ref_camera_id");
+    
+    bool relative_poses_specified;
+    bool is_first_camera = true;
 
     std::vector<std::string> image_prefixes;
     for (const auto& camera : rig_config.second.get_child("cameras")) {
       const int camera_id = camera.second.get<int>("camera_id");
       image_prefixes.push_back(camera.second.get<std::string>("image_prefix"));
-      camera_rig.AddCamera(camera_id, ComposeIdentityQuaternion(),
-                           Eigen::Vector3d(0, 0, 0));
+      
+      auto qvec_child = camera.second.find("rel_qvec");
+      auto tvec_child = camera.second.find("rel_tvec");
+      
+      if (camera_id == ref_camera_id) {
+        if (qvec_child != camera.second.not_found() || tvec_child != camera.second.not_found()) {
+          std::cout << "Error: rel_qvec and / or rel_tvec given for the reference camera.\n";
+          exit(EXIT_FAILURE);
+        }
+      } else {
+        if ((qvec_child != camera.second.not_found() && tvec_child == camera.second.not_found()) ||
+            (qvec_child == camera.second.not_found() && tvec_child != camera.second.not_found())) {
+          std::cout << "Error: Only one of rel_qvec and rel_tvec specified for a camera in the rig.\n";
+          exit(EXIT_FAILURE);
+        }
+        
+        if (is_first_camera) {
+          relative_poses_specified = qvec_child != camera.second.not_found();
+          is_first_camera = false;
+        } else {
+          if (relative_poses_specified != (qvec_child != camera.second.not_found())) {
+            std::cout << "Error: Relative poses in the rig must either be specified for all cameras or for none.\n";
+            exit(EXIT_FAILURE);
+          }
+        }
+      }
+      
+      Eigen::Vector4d rel_qvec = ComposeIdentityQuaternion();
+      if (qvec_child != camera.second.not_found()) {
+        int i = 0;
+        for (const auto& value : qvec_child->second) {
+          rel_qvec[i] = value.second.get_value<double>();
+          ++ i;
+        }
+        if (i != 4) {
+          std::cout << "Error: Wrong number of values for rel_qvec.\n";
+          exit(1);
+        }
+      }
+      
+      Eigen::Vector3d rel_tvec = Eigen::Vector3d::Zero();
+      if (tvec_child != camera.second.not_found()) {
+        int i = 0;
+        for (const auto& value : tvec_child->second) {
+          rel_tvec[i] = value.second.get_value<double>();
+          ++ i;
+        }
+        if (i != 3) {
+          std::cout << "Error: Wrong number of values for rel_tvec.\n";
+          exit(1);
+        }
+      }
+      
+      camera_rig.AddCamera(camera_id, rel_qvec, rel_tvec);
     }
 
-    camera_rig.SetRefCameraId(rig_config.second.get<int>("ref_camera_id"));
+    camera_rig.SetRefCameraId(ref_camera_id);
 
     std::unordered_map<std::string, std::vector<image_t>> snapshots;
     for (const auto image_id : reconstruction.RegImageIds()) {
@@ -1472,7 +1538,51 @@ std::vector<CameraRig> ReadCameraRigConfig(
     }
 
     camera_rig.Check(reconstruction);
-    camera_rig.ComputeRelativePoses(reconstruction);
+    if (relative_poses_specified) {
+      // Scale the reconstruction to match the manually specified rig's scale
+      double scaling_log_sum = 0;
+      std::size_t scaling_count = 0;
+      
+      for (const auto& snapshot : camera_rig.Snapshots()) {
+        // Find the image of the reference camera in the current snapshot.
+        const Image* ref_image = nullptr;
+        for (const auto image_id : snapshot) {
+          const auto& image = reconstruction.Image(image_id);
+          if (image.CameraId() == camera_rig.RefCameraId()) {
+            ref_image = &image;
+          }
+        }
+
+        CHECK_NOTNULL(ref_image);
+        
+        for (const auto image_id : snapshot) {
+          const auto& image = reconstruction.Image(image_id);
+          if (image.CameraId() != camera_rig.RefCameraId()) {
+            Eigen::Vector4d rel_qvec_actual;
+            Eigen::Vector3d rel_tvec_actual;
+            ComputeRelativePose(ref_image->Qvec(), ref_image->Tvec(), image.Qvec(),
+                                image.Tvec(), &rel_qvec_actual, &rel_tvec_actual);
+            
+            const Eigen::Vector3d& rel_tvec_specified = camera_rig.RelativeTvec(image.CameraId());
+            
+            double actual_length = rel_tvec_actual.norm();
+            if (actual_length < std::numeric_limits<double>::epsilon()) {
+              continue;
+            }
+            
+            scaling_log_sum += std::log(rel_tvec_specified.norm() / actual_length);
+            scaling_count += 1;
+          }
+        }
+      }
+      
+      double scaling_factor = std::exp(scaling_log_sum / scaling_count);
+      SimilarityTransform3 scaling_transform(scaling_factor, ComposeIdentityQuaternion(), Eigen::Vector3d(0, 0, 0));
+      reconstruction.Transform(scaling_transform);
+    } else {
+      // Estimate the rig's relative poses (including scale) from the reconstruction
+      camera_rig.ComputeRelativePoses(reconstruction);
+    }
 
     camera_rigs.push_back(camera_rig);
   }
@@ -1486,10 +1596,13 @@ int RunRigBundleAdjuster(int argc, char** argv) {
   std::string rig_config_path;
 
   OptionManager options;
+  RigBundleAdjuster::Options rig_ba_options;
   options.AddRequiredOption("input_path", &input_path);
   options.AddRequiredOption("output_path", &output_path);
   options.AddRequiredOption("rig_config_path", &rig_config_path);
   options.AddBundleAdjustmentOptions();
+  options.AddDefaultOption("refine_relative_poses", &rig_ba_options.refine_relative_poses);
+  options.AddDefaultOption("max_reproj_error", &rig_ba_options.max_reproj_error);
   options.Parse(argc, argv);
 
   Reconstruction reconstruction;
@@ -1518,7 +1631,6 @@ int RunRigBundleAdjuster(int argc, char** argv) {
 
   BundleAdjustmentOptions ba_options = *options.bundle_adjustment;
   ba_options.solver_options.minimizer_progress_to_stdout = true;
-  RigBundleAdjuster::Options rig_ba_options;
   RigBundleAdjuster bundle_adjuster(ba_options, rig_ba_options, config);
   CHECK(bundle_adjuster.Solve(&reconstruction, &camera_rigs));
 
